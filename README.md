@@ -1,4 +1,4 @@
-The project is to test that ollama+rag+django project is implemented by chatgpt.  
+The project is to test that ollama+rag+django implemented by chatgpt.  
 
 added rag_project  
 django-admin startproject rag_project
@@ -23,6 +23,7 @@ python manage.py startapp chat
 updated rag_project/urls 
 
 must run
-python chat/ingest.py # otherwise docs might not be found.
+python chat/ingest.py # otherwise docs collection might not be found.
 
-
+The following query working (text only)
+xxx@u2204nv:~/git/ollama_rag_django$ curl -X POST -F "message=What is Django?" http://localhost:8000/chat/
