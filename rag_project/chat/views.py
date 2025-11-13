@@ -1,6 +1,3 @@
-#from django.shortcuts import render
-# Create your views here.
-
 from django.views.decorators.csrf import csrf_exempt
 from django.http import JsonResponse, HttpRequest
 import base64
@@ -49,7 +46,16 @@ def chat(request: HttpRequest):
         except Exception as e:
             return JsonResponse({"error": f"Qdrant query failed: {str(e)}"}, status=500)
 
-        context = "\n".join(docs) if docs else "No relevant context found."
+        # Extract text snippets from Qdrant results
+        context_parts = []
+        if isinstance(docs, list):
+            for hit in docs:
+                if isinstance(hit, dict):
+                    context_parts.append(hit.get("text", ""))
+                elif isinstance(hit, str):
+                    context_parts.append(hit)
+
+        context = "\n\n".join(context_parts) if context_parts else "No relevant context found."
         prompt = f"Context:\n{context}\n\nUser Query: {user_input}"
 
         # --- Generate response with Ollama ---
@@ -62,5 +68,3 @@ def chat(request: HttpRequest):
 
     # --- Only POST requests are supported ---
     return JsonResponse({"error": "Only POST method is supported."}, status=405)
-
-

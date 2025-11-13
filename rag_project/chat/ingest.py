@@ -1,36 +1,31 @@
 import os
-import io
-import base64
 from typing import List, Union
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from sentence_transformers import SentenceTransformer
-
-# --- Document and image parsing imports ---
 from PyPDF2 import PdfReader
 from docx import Document
 from PIL import Image
 import numpy as np
 
-# --- Models ---
-TEXT_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-IMAGE_MODEL = "clip-ViT-B-32"  # multimodal model for images
-
-# --- Initialize Qdrant and models ---
-qdrant = QdrantClient(host="localhost", port=6333)
-text_embedder = SentenceTransformer(TEXT_MODEL)
-image_embedder = SentenceTransformer(IMAGE_MODEL)
-
+# --- Model configuration ---
+MODEL_NAME = "clip-ViT-B-32"  # Multimodal: works for text + images (512D)
+VECTOR_SIZE = 512
 COLLECTION_NAME = "docs"
 
-# --- Create collection if not exists ---
+# --- Initialize model and client ---
+embedder = SentenceTransformer(MODEL_NAME)
+qdrant = QdrantClient(host="localhost", port=6333)
+
+# --- Create collection if it doesn’t exist ---
 if not qdrant.collection_exists(COLLECTION_NAME):
     qdrant.create_collection(
         collection_name=COLLECTION_NAME,
-        vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+        vectors_config=VectorParams(size=VECTOR_SIZE, distance=Distance.COSINE),
     )
+    print(f"[INIT] Created collection '{COLLECTION_NAME}' with dim={VECTOR_SIZE}")
 
-# --- File type handlers ---
+# --- Helpers for file reading ---
 def extract_text_from_pdf(file_path: str) -> str:
     try:
         reader = PdfReader(file_path)
@@ -50,7 +45,7 @@ def extract_text_from_docx(file_path: str) -> str:
 def extract_vector_from_image(file_path: str) -> Union[np.ndarray, None]:
     try:
         image = Image.open(file_path).convert("RGB")
-        return image_embedder.encode(image)
+        return embedder.encode(image)
     except Exception as e:
         print(f"[WARN] Failed to process image {file_path}: {e}")
         return None
@@ -58,15 +53,13 @@ def extract_vector_from_image(file_path: str) -> Union[np.ndarray, None]:
 # --- Main ingestion function ---
 def ingest_files(inputs: List[str]):
     """
-    Ingests a list of file paths or directories.
-    Supports text, docx, pdf, and common image files.
+    Ingests PDFs, DOCX, TXT, and images (JPG, PNG, etc.) into one multimodal Qdrant collection.
     """
     points = []
     idx = 0
-
     supported_exts = [".txt", ".pdf", ".doc", ".docx", ".png", ".jpg", ".jpeg", ".bmp"]
 
-    # --- Expand directories ---
+    # --- Collect all files ---
     all_files = []
     for path in inputs:
         if os.path.isdir(path):
@@ -79,34 +72,32 @@ def ingest_files(inputs: List[str]):
         else:
             print(f"[SKIP] Invalid path: {path}")
 
-    # --- Process files ---
+    # --- Process and encode files ---
     for file_path in all_files:
         ext = os.path.splitext(file_path)[1].lower()
-        content = None
+        content = ""
         vector = None
 
         if ext == ".txt":
             try:
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                     content = f.read()
-                    vector = text_embedder.encode(content).tolist()
+                    vector = embedder.encode(content)
             except Exception as e:
                 print(f"[WARN] Failed to read TXT {file_path}: {e}")
 
         elif ext == ".pdf":
             content = extract_text_from_pdf(file_path)
             if content:
-                vector = text_embedder.encode(content).tolist()
+                vector = embedder.encode(content)
 
         elif ext in [".doc", ".docx"]:
             content = extract_text_from_docx(file_path)
             if content:
-                vector = text_embedder.encode(content).tolist()
+                vector = embedder.encode(content)
 
         elif ext in [".png", ".jpg", ".jpeg", ".bmp"]:
             vector = extract_vector_from_image(file_path)
-            if vector is not None:
-                vector = vector.tolist()
             content = f"Image file: {os.path.basename(file_path)}"
 
         else:
@@ -114,36 +105,51 @@ def ingest_files(inputs: List[str]):
             continue
 
         if vector is not None:
-            points.append(PointStruct(id=idx, vector=vector, payload={"text": content or "", "path": file_path}))
+            points.append(
+                PointStruct(
+                    id=idx,
+                    vector=vector.tolist(),
+                    payload={"text": content or "", "path": file_path},
+                )
+            )
             idx += 1
 
+    # --- Upload to Qdrant ---
     if points:
         qdrant.upsert(collection_name=COLLECTION_NAME, points=points)
-        print(f"[INFO] Successfully ingested {len(points)} items.")
+        print(f"[INFO] Successfully ingested {len(points)} items into '{COLLECTION_NAME}'")
     else:
         print("[WARN] No valid files found for ingestion.")
 
 # --- Query function ---
 def query_qdrant(query: str, top_k: int = 3) -> List[str]:
     """
-    Searches the Qdrant collection for documents similar to the query.
+    Searches Qdrant collection for documents or images similar to the query (text or image path).
     """
     if not query:
         return []
 
-    vector = text_embedder.encode(query).tolist()
-    search_result = qdrant.search(collection_name=COLLECTION_NAME, query_vector=vector, limit=top_k)
-    return [hit.payload.get("text", "") for hit in search_result]
+    # Handle query type (text or image file path)
+    if os.path.isfile(query) and os.path.splitext(query)[1].lower() in [".png", ".jpg", ".jpeg", ".bmp"]:
+        vector = extract_vector_from_image(query)
+    else:
+        vector = embedder.encode(query)
+
+    if vector is None:
+        print("[WARN] Could not encode query.")
+        return []
+
+    search_result = qdrant.search(
+        collection_name=COLLECTION_NAME,
+        query_vector=vector.tolist(),
+        limit=top_k,
+    )
+
+    return [hit.payload.get("text", "") + " (" + hit.payload.get("path", "") + ")" for hit in search_result]
 
 # --- Example usage ---
 if __name__ == "__main__":
-    # You can pass a mix of directories and files
-    sources = [
-        "../../../data/"   # a directory containing pdf/docx/txt/image files
-        #docs/intro.pdf",    # a specific file
-        #"images/"            # an image directory
-    ]
-
+    sources = ["../../../data/"]  # directory containing PDFs, DOCX, TXT, and images
     ingest_files(sources)
 
     query = "Explain Django and its purpose."
@@ -151,5 +157,3 @@ if __name__ == "__main__":
     print("\n🔍 Query Results:")
     for i, r in enumerate(results, start=1):
         print(f"{i}. {r[:300]}{'...' if len(r) > 300 else ''}")
-
-
